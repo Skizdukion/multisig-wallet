@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-struct AuthorityCallback {
-    address targetAddress;
-    uint8 securityLevel1PercentageChanged;
-    uint8 securityLevel2PercentageChanged;
-    bool isAddOwners;
-    bool isRemoveOwners;
+import "hardhat/console.sol";
+
+/// @notice This enum use for seperate modify authority callback function
+enum MultiSigCallBackType {
+    ADD_OWNER,
+    REMOVE_OWNER,
+    SECURITY_LEVEL_PERCENTAGE_CHANGE,
+    NEW_SUBMIT_TRANSACTION_SECURITYLEVEL_CHANGE
 }
 
+/// @notice This struct would carries data about which kind of callback function and their parameter
+struct MultiSigCallBack {
+    MultiSigCallBackType functionType;
+    bytes encodedData;
+}
+
+/// @notice Transaction could represent anything normal activities from a normal wallet
+/// @notice In this contract, transaction could also change some authority value like add owner, remove owner, …
 struct Transaction {
     address to;
     uint256 value;
@@ -16,15 +26,20 @@ struct Transaction {
     bool executed;
     bool autoExecWhenEnoughConfirmation;
     uint256 numConfirmations;
-    uint256 numOfConfirmationsNeededToExecute;
+    uint8 securityLevel;
 }
 
-struct SecurityLevel {
-    uint8 level1PercentageNeeded; // 50% of owners should confirm tx or function to execute
-    uint8 level2PercentageNeeded; // 80% of owners should confirm tx or function to execute
-    uint8 level3PercentageNeeded; // 100% of onwers should confirm tx or function to execute and unmodifiable
+/// @notice Each represent a level of security, which is the percentage of total owners to confirms a transaction in order to execute
+/// @notice By default level1 is 50%, level2 is 80%, and level3 is 100%
+struct PercentageOfEachSecurityLevel {
+    uint8 level1;
+    uint8 level2;
+    uint8 level3;
 }
 
+/// @title A contract function as a multi-signature wallet
+/// @notice You can use this contract for replacement for DAO version with trusted parties
+/// @dev This contract ins't fully tested and auditted
 contract MultiSigWallet {
     event Deposit(address indexed sender, uint256 amount, uint256 balance);
     event SubmitTransaction(
@@ -37,21 +52,21 @@ contract MultiSigWallet {
     event ConfirmTransaction(address indexed owner, uint256 indexed txIndex);
     event RevokeConfirmation(address indexed owner, uint256 indexed txIndex);
     event ExecuteTransaction(address indexed owner, uint256 indexed txIndex);
-    event AuthorityChanged(
-        address indexed owner,
-        uint256 totalOwners,
-        uint8 level1Percentage,
-        uint8 level2Percentage
-    );
+    event NewOwnerAdded(address indexed newOwner);
+    event RemoveOwner(address indexed owner);
+    event SecurityPercentageOfEachLevelChanged(uint8 level1Percentage, uint8 level2Percentage);
+    event NewSubmitTranscationSecurityLevel(uint8 newValue);
 
     address[] public owners;
     mapping(address => bool) public isOwner;
     uint256 public numConfirmationsRequired;
-    SecurityLevel securityLevel;
+    uint8 public newSubmitTranscationSecurityLevel = 1;
+    PercentageOfEachSecurityLevel percentageOfEachLevel;
 
-    // mapping from tx index => owner => bool
+    // Mapping from tx index => owner => bool
     mapping(uint256 => mapping(address => bool)) public isConfirmed;
 
+    // All transaction from this contract
     Transaction[] public transactions;
 
     modifier onlyOwner() {
@@ -87,10 +102,10 @@ contract MultiSigWallet {
             owners.push(owner);
         }
 
-        securityLevel = SecurityLevel({
-            level1PercentageNeeded: 50,
-            level2PercentageNeeded: 80,
-            level3PercentageNeeded: 100
+        percentageOfEachLevel = PercentageOfEachSecurityLevel({
+            level1: 50,
+            level2: 80,
+            level3: 100
         });
     }
 
@@ -98,49 +113,68 @@ contract MultiSigWallet {
         emit Deposit(msg.sender, msg.value, address(this).balance);
     }
 
+    /// @notice This contract use fallback function as a way to modify authority state
+    /// @dev Only authority_modify function could be executed here
     fallback() external payable {
         if (msg.sender == address(this)) {
-            AuthorityCallback memory authorityChanged = abi.decode(msg.data, (AuthorityCallback));
-            _changeAuthority(authorityChanged);
+            MultiSigCallBack memory multiSigCallback = abi.decode(msg.data, (MultiSigCallBack));
+            if (multiSigCallback.functionType == MultiSigCallBackType.ADD_OWNER) {
+                address newOwner = abi.decode(multiSigCallback.encodedData, (address));
+                _addOwner(newOwner);
+            } else if (multiSigCallback.functionType == MultiSigCallBackType.REMOVE_OWNER) {
+                address owner = abi.decode(multiSigCallback.encodedData, (address));
+                _removeOwner(owner);
+            } else if (
+                multiSigCallback.functionType ==
+                MultiSigCallBackType.SECURITY_LEVEL_PERCENTAGE_CHANGE
+            ) {
+                (uint8 level1NewValue, uint8 level2NewValue) = abi.decode(
+                    multiSigCallback.encodedData,
+                    (uint8, uint8)
+                );
+                _changePercentageAtEachLevel(level1NewValue, level2NewValue);
+            } else if (
+                multiSigCallback.functionType ==
+                MultiSigCallBackType.NEW_SUBMIT_TRANSACTION_SECURITYLEVEL_CHANGE
+            ) {
+                uint8 newValue = abi.decode(multiSigCallback.encodedData, (uint8));
+                _changeNewSubmitTranscationSecurityLevel(newValue);
+            }
+        } else {
+            console.log("Some one try to attack this contract by fallback");
         }
     }
 
-    function _changeAuthority(AuthorityCallback memory newAuthority) private {
-        if (newAuthority.isAddOwners) {
-            owners.push(newAuthority.targetAddress);
-            isOwner[newAuthority.targetAddress] = true;
-        }
+    function _addOwner(address newOwner) private {
+        owners.push(newOwner);
+        isOwner[newOwner] = true;
+    }
 
-        if (newAuthority.isRemoveOwners) {
-            uint256 removeOwnerIndex = owners.length;
-            for (uint256 i = 0; i < owners.length; i++) {
-                if (newAuthority.targetAddress == owners[i]) {
-                    removeOwnerIndex = i;
-                    break;
-                }
+    function _removeOwner(address owner) private {
+        uint256 removeOwnerIndex = owners.length;
+        for (uint256 i = 0; i < owners.length; i++) {
+            if (owner == owners[i]) {
+                removeOwnerIndex = i;
+                break;
             }
-            require(removeOwnerIndex != owners.length, "Want-to-remove address not found");
-            address temp = owners[owners.length - 1];
-            owners[owners.length - 1] = newAuthority.targetAddress;
-            owners[removeOwnerIndex] = temp;
-            owners.pop();
-            isOwner[newAuthority.targetAddress] = false;
         }
+        require(removeOwnerIndex != owners.length, "Want-to-remove address not found");
+        address temp = owners[owners.length - 1];
+        owners[owners.length - 1] = owner;
+        owners[removeOwnerIndex] = temp;
+        owners.pop();
+        isOwner[owner] = false;
+    }
 
-        if (newAuthority.securityLevel1PercentageChanged != 0) {
-            securityLevel.level1PercentageNeeded = newAuthority.securityLevel1PercentageChanged;
-        }
+    function _changePercentageAtEachLevel(uint8 newPercentageAtLevel1, uint8 newPercentageAtLevel2)
+        private
+    {
+        percentageOfEachLevel.level1 = newPercentageAtLevel1;
+        percentageOfEachLevel.level2 = newPercentageAtLevel2;
+    }
 
-        if (newAuthority.securityLevel2PercentageChanged != 0) {
-            securityLevel.level2PercentageNeeded = newAuthority.securityLevel2PercentageChanged;
-        }
-
-        emit AuthorityChanged(
-            msg.sender,
-            owners.length,
-            securityLevel.level1PercentageNeeded,
-            securityLevel.level2PercentageNeeded
-        );
+    function _changeNewSubmitTranscationSecurityLevel(uint8 newValue) private {
+        newSubmitTranscationSecurityLevel = newValue;
     }
 
     function calculateConfirmationsNeeded(uint8 percentage, uint256 totalOwnersLength)
@@ -153,20 +187,20 @@ contract MultiSigWallet {
 
         if (mod > 50) div = div + 1;
 
-        if (div < 2) {
+        if (div < 2 && totalOwnersLength > 2) {
             confirmations = 2;
         } else {
             confirmations = div;
         }
     }
 
-    function submitTransaction(
+    function _createNewTransaction(
         address _to,
         uint256 _value,
         bytes memory _data,
-        bool autoExec
-    ) public onlyOwner {
-        require(_to != address(this), "Not allow to do this");
+        bool autoExec,
+        uint8 transactionSecurityLevel
+    ) internal {
         uint256 txIndex = transactions.length;
         isConfirmed[txIndex][msg.sender] = true;
         transactions.push(
@@ -177,16 +211,32 @@ contract MultiSigWallet {
                 executed: false,
                 autoExecWhenEnoughConfirmation: autoExec,
                 numConfirmations: 1,
-                numOfConfirmationsNeededToExecute: calculateConfirmationsNeeded(
-                    securityLevel.level1PercentageNeeded,
-                    owners.length
-                )
+                securityLevel: transactionSecurityLevel
             })
         );
-
         emit SubmitTransaction(msg.sender, txIndex, _to, _value, _data);
     }
 
+    /// @notice Submitted new transaction
+    /// @notice These transaction later will be confirms by different owners
+    /// @notice These are two kind of transaction, normal transaction and authority_modify transaction
+    /// @notice This function is only work for create new normal transaction
+    /// @dev For example, A transaction for transfer ERC20 from this contract to another wallet by using etherjs
+    /// @dev const data = ERC20Contract.interface.encodeFunctionData("transfer", [anotherWallet, amount])
+    /// @dev thisContract.submitTransaction(ERC20Contract.address, 0, data, true)
+    function submitTransaction(
+        address _to,
+        uint256 _value,
+        bytes memory _data,
+        bool _autoExec
+    ) public onlyOwner {
+        require(_to != address(this), "Cannot submit authority_modify transaction by this way");
+        _createNewTransaction(_to, _value, _data, _autoExec, newSubmitTranscationSecurityLevel);
+    }
+
+    /// @notice Confirming existed transaction
+    /// @notice When enough confirmations according to the transaction security level,
+    /// @notice it will automatic execute transaction depends on 'autoExecWhenEnoughConfirmation' value
     function confirmTransaction(uint256 _txIndex)
         public
         onlyOwner
@@ -198,9 +248,11 @@ contract MultiSigWallet {
         transaction.numConfirmations += 1;
         isConfirmed[_txIndex][msg.sender] = true;
         emit ConfirmTransaction(msg.sender, _txIndex);
+        // console.log("Tx: %s, security level: %s", _txIndex, transaction.securityLevel);
         if (
             transaction.autoExecWhenEnoughConfirmation &&
-            (transaction.numConfirmations >= transaction.numOfConfirmationsNeededToExecute)
+            (transaction.numConfirmations >=
+                getComfirmationsNeededWithLevel(transaction.securityLevel))
         ) {
             executeTransaction(_txIndex);
         }
@@ -214,7 +266,11 @@ contract MultiSigWallet {
     {
         Transaction storage transaction = transactions[_txIndex];
 
-        require(transaction.numConfirmations >= numConfirmationsRequired, "cannot execute tx");
+        require(
+            transaction.numConfirmations >=
+                getComfirmationsNeededWithLevel(transaction.securityLevel),
+            "cannot execute tx"
+        );
 
         transaction.executed = true;
 
@@ -224,6 +280,7 @@ contract MultiSigWallet {
         emit ExecuteTransaction(msg.sender, _txIndex);
     }
 
+    /// @notice Revoke an already confirm transaction
     function revokeConfirmation(uint256 _txIndex)
         public
         onlyOwner
@@ -248,22 +305,19 @@ contract MultiSigWallet {
         return transactions.length;
     }
 
-    function getLv1ComfirmationsNeededNow() public view returns (uint256 confirmations) {
+    function getComfirmationsNeededWithLevel(uint8 level)
+        public
+        view
+        returns (uint256 confirmations)
+    {
+        require((level > 0 && level < 4), "Level must from 1 to 3");
+
         confirmations = calculateConfirmationsNeeded(
-            securityLevel.level1PercentageNeeded,
+            (level == 1)
+                ? percentageOfEachLevel.level1
+                : ((level == 2) ? percentageOfEachLevel.level2 : percentageOfEachLevel.level3),
             owners.length
         );
-    }
-
-    function getLv2ComfirmationsNeededNow() public view returns (uint256 confirmations) {
-        confirmations = calculateConfirmationsNeeded(
-            securityLevel.level2PercentageNeeded,
-            owners.length
-        );
-    }
-
-    function getLv3ComfirmationsNeededNow() public view returns (uint256 confirmations) {
-        confirmations = owners.length;
     }
 
     function getTransaction(uint256 _txIndex)
@@ -274,7 +328,8 @@ contract MultiSigWallet {
             uint256 value,
             bytes memory data,
             bool executed,
-            uint256 numConfirmations
+            uint256 numConfirmations,
+            uint8 transactionSecurityLevel
         )
     {
         Transaction storage transaction = transactions[_txIndex];
@@ -284,80 +339,73 @@ contract MultiSigWallet {
             transaction.value,
             transaction.data,
             transaction.executed,
-            transaction.numConfirmations
+            transaction.numConfirmations,
+            transaction.securityLevel
         );
     }
 
-    function addOwners(address newOwner) public onlyOwner {
-        uint256 txIndex = transactions.length;
-        isConfirmed[txIndex][msg.sender] = true;
-        AuthorityCallback memory callBack;
-        callBack.isAddOwners = true;
-        callBack.targetAddress = newOwner;
+    /// @notice An authority_modify function
+    /// @notice This function corresponding to MultiSigCallBackType.ADD_OWNER
+    /// @dev returns field should use for testing only and can be remove in pratical use
+    function addOwners(address newOwner) external onlyOwner returns (bytes memory) {
+        require(!isOwner[newOwner], "This address is already a owner");
+        MultiSigCallBack memory callBack;
+        callBack.functionType = MultiSigCallBackType.ADD_OWNER;
+        callBack.encodedData = abi.encode(newOwner);
         bytes memory data = abi.encode(callBack);
-        transactions.push(
-            Transaction({
-                to: address(this),
-                value: 0,
-                data: data,
-                executed: false,
-                autoExecWhenEnoughConfirmation: true,
-                numConfirmations: 1,
-                numOfConfirmationsNeededToExecute: calculateConfirmationsNeeded(
-                    securityLevel.level3PercentageNeeded,
-                    owners.length
-                )
-            })
-        );
+        _createNewTransaction(address(this), 0, data, true, 3);
+        return data;
     }
 
-    function removeOwner(address oldOwner) public onlyOwner {
-        require(owners.length > 2, "Reached Minimum owners");
-        uint256 txIndex = transactions.length;
-        isConfirmed[txIndex][msg.sender] = true;
-        AuthorityCallback memory callBack;
-        callBack.isRemoveOwners = true;
-        callBack.targetAddress = oldOwner;
-        bytes memory data = abi.encode(callBack);
-        transactions.push(
-            Transaction({
-                to: address(this),
-                value: 0,
-                data: data,
-                executed: false,
-                autoExecWhenEnoughConfirmation: true,
-                numConfirmations: 1,
-                numOfConfirmationsNeededToExecute: calculateConfirmationsNeeded(
-                    securityLevel.level2PercentageNeeded,
-                    owners.length
-                )
-            })
-        );
-    }
-
-    function changeSecurityLevel(uint8 level1PercentageChange, uint8 level2PercentageChange)
-        public
+    /// @notice An authority_modify function
+    /// @notice This function corresponding to MultiSigCallBackType.NEW_SUBMIT_TRANSACTION_SECURITYLEVEL_CHANGE
+    /// @notice This will modify a default security value on creating normal transaction
+    /// @dev returns field should use for testing only and can be remove in pratical use
+    function setNewSubmitTransactionSecurityLevel(uint8 newLevel)
+        external
         onlyOwner
+        returns (bytes memory)
     {
-        uint256 txIndex = transactions.length;
-        isConfirmed[txIndex][msg.sender] = true;
-        AuthorityCallback memory callBack;
-        callBack.securityLevel1PercentageChanged = level1PercentageChange;
-        callBack.securityLevel2PercentageChanged = level2PercentageChange;
-        bytes memory data = abi.encode(callBack);
-        transactions.push(
-            Transaction({
-                to: address(this),
-                value: 0,
-                data: data,
-                executed: false,
-                autoExecWhenEnoughConfirmation: true,
-                numConfirmations: 1,
-                numOfConfirmationsNeededToExecute: calculateConfirmationsNeeded(
-                    securityLevel.level3PercentageNeeded,
-                    owners.length
-                )
-            })
+        require(
+            (newLevel > 0 && newLevel < 3 && newLevel != newSubmitTranscationSecurityLevel),
+            "Level must from 1 to 3 and different from the old one"
         );
+        MultiSigCallBack memory callBack;
+        callBack.functionType = MultiSigCallBackType.NEW_SUBMIT_TRANSACTION_SECURITYLEVEL_CHANGE;
+        callBack.encodedData = abi.encode(newLevel);
+        bytes memory data = abi.encode(callBack);
+        _createNewTransaction(address(this), 0, data, true, 3);
+        return data;
+    }
+
+    /// @notice An authority_modify function
+    /// @notice This function corresponding to MultiSigCallBackType.REMOVE_OWNER
+    /// @notice This function need lv2 security in case of creating malicious transaction or lost
+    /// @dev returns field should use for testing only and can be remove in pratical use
+    function removeOwner(address oldOwner) external onlyOwner returns (bytes memory) {
+        require(owners.length > 2, "Reached Minimum owners");
+        require(isOwner[oldOwner], "Not Owner of this contract");
+        MultiSigCallBack memory callBack;
+        callBack.functionType = MultiSigCallBackType.REMOVE_OWNER;
+        callBack.encodedData = abi.encode(oldOwner);
+        bytes memory data = abi.encode(callBack);
+        _createNewTransaction(address(this), 0, data, true, 2);
+        return data;
+    }
+
+    /// @notice An authority_modify function
+    /// @notice This function corresponding to MultiSigCallBackType.REMOVE_OWNER
+    /// @notice This will modify a percentage of lv1, lv2 security
+    /// @dev returns field should use for testing only and can be remove in pratical use
+    function changePercentageNeededInSecurityLevel(
+        uint8 level1PercentageChange,
+        uint8 level2PercentageChange
+    ) external onlyOwner returns (bytes memory) {
+        MultiSigCallBack memory callBack;
+        callBack.functionType = MultiSigCallBackType.SECURITY_LEVEL_PERCENTAGE_CHANGE;
+        callBack.encodedData = abi.encode(level1PercentageChange, level2PercentageChange);
+        bytes memory data = abi.encode(callBack);
+        _createNewTransaction(address(this), 0, data, true, 3);
+        return data;
     }
 }
