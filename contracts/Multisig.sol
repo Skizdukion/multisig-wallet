@@ -8,7 +8,8 @@ enum MultiSigCallBackType {
     ADD_OWNER,
     REMOVE_OWNER,
     SECURITY_LEVEL_PERCENTAGE_CHANGE,
-    NEW_SUBMIT_TRANSACTION_SECURITYLEVEL_CHANGE
+    NEW_SUBMIT_TRANSACTION_SECURITYLEVEL_CHANGE,
+    TIME_LIMIT_EACH_TRANS_CHANGE
 }
 
 /// @notice This struct would carries data about which kind of callback function and their parameter
@@ -26,6 +27,7 @@ struct Transaction {
     bool executed;
     bool autoExecWhenEnoughConfirmation;
     uint256 numConfirmations;
+    uint256 deadline;
     uint8 securityLevel;
 }
 
@@ -55,13 +57,15 @@ contract MultiSigWallet {
     event NewOwnerAdded(address indexed newOwner);
     event RemoveOwner(address indexed owner);
     event SecurityPercentageOfEachLevelChanged(uint8 level1Percentage, uint8 level2Percentage);
-    event NewSubmitTranscationSecurityLevel(uint8 newValue);
+    event NewSubmitTransactionSecurityLevel(uint8 newValue);
 
     address[] public owners;
+    uint256 immutable MAX_UINT = 2**256 - 1;
     mapping(address => bool) public isOwner;
-    uint256 public numConfirmationsRequired;
-    uint8 public newSubmitTranscationSecurityLevel = 1;
-    PercentageOfEachSecurityLevel percentageOfEachLevel;
+    uint8 public newSubmitTransactionSecurityLevel = 1;
+    /// @notice 0 means there is no limit for execute the contract
+    uint256 public timeLimitForEachTransaction = 0;
+    PercentageOfEachSecurityLevel public percentageOfEachLevel;
 
     // Mapping from tx index => owner => bool
     mapping(uint256 => mapping(address => bool)) public isConfirmed;
@@ -81,6 +85,11 @@ contract MultiSigWallet {
 
     modifier notExecuted(uint256 _txIndex) {
         require(!transactions[_txIndex].executed, "tx already executed");
+        _;
+    }
+
+    modifier notExpired(uint256 _txIndex) {
+        require(transactions[_txIndex].deadline >= block.timestamp, "tx epxired");
         _;
     }
 
@@ -139,6 +148,11 @@ contract MultiSigWallet {
             ) {
                 uint8 newValue = abi.decode(multiSigCallback.encodedData, (uint8));
                 _changeNewSubmitTranscationSecurityLevel(newValue);
+            } else if (
+                multiSigCallback.functionType == MultiSigCallBackType.TIME_LIMIT_EACH_TRANS_CHANGE
+            ) {
+                uint256 newValue = abi.decode(multiSigCallback.encodedData, (uint256));
+                _changeTimeLimitEachTransaction(newValue);
             }
         } else {
             console.log("Some one try to attack this contract by fallback");
@@ -174,7 +188,11 @@ contract MultiSigWallet {
     }
 
     function _changeNewSubmitTranscationSecurityLevel(uint8 newValue) private {
-        newSubmitTranscationSecurityLevel = newValue;
+        newSubmitTransactionSecurityLevel = newValue;
+    }
+
+    function _changeTimeLimitEachTransaction(uint256 newValue) private {
+        timeLimitForEachTransaction = newValue;
     }
 
     function calculateConfirmationsNeeded(uint8 percentage, uint256 totalOwnersLength)
@@ -211,7 +229,10 @@ contract MultiSigWallet {
                 executed: false,
                 autoExecWhenEnoughConfirmation: autoExec,
                 numConfirmations: 1,
-                securityLevel: transactionSecurityLevel
+                securityLevel: transactionSecurityLevel,
+                deadline: (timeLimitForEachTransaction == 0)
+                    ? MAX_UINT
+                    : block.timestamp + timeLimitForEachTransaction
             })
         );
         emit SubmitTransaction(msg.sender, txIndex, _to, _value, _data);
@@ -231,7 +252,7 @@ contract MultiSigWallet {
         bool _autoExec
     ) public onlyOwner {
         require(_to != address(this), "Cannot submit authority_modify transaction by this way");
-        _createNewTransaction(_to, _value, _data, _autoExec, newSubmitTranscationSecurityLevel);
+        _createNewTransaction(_to, _value, _data, _autoExec, newSubmitTransactionSecurityLevel);
     }
 
     /// @notice Confirming existed transaction
@@ -243,6 +264,7 @@ contract MultiSigWallet {
         txExists(_txIndex)
         notExecuted(_txIndex)
         notConfirmed(_txIndex)
+        notExpired(_txIndex)
     {
         Transaction storage transaction = transactions[_txIndex];
         transaction.numConfirmations += 1;
@@ -263,6 +285,7 @@ contract MultiSigWallet {
         onlyOwner
         txExists(_txIndex)
         notExecuted(_txIndex)
+        notExpired(_txIndex)
     {
         Transaction storage transaction = transactions[_txIndex];
 
@@ -367,7 +390,7 @@ contract MultiSigWallet {
         returns (bytes memory)
     {
         require(
-            (newLevel > 0 && newLevel < 3 && newLevel != newSubmitTranscationSecurityLevel),
+            (newLevel > 0 && newLevel < 3 && newLevel != newSubmitTransactionSecurityLevel),
             "Level must from 1 to 3 and different from the old one"
         );
         MultiSigCallBack memory callBack;
@@ -401,11 +424,32 @@ contract MultiSigWallet {
         uint8 level1PercentageChange,
         uint8 level2PercentageChange
     ) external onlyOwner returns (bytes memory) {
+        require(
+            level1PercentageChange < level2PercentageChange && level1PercentageChange > 0,
+            "Not as correct format"
+        );
+        require(level2PercentageChange < 100, "Not as correct format");
         MultiSigCallBack memory callBack;
         callBack.functionType = MultiSigCallBackType.SECURITY_LEVEL_PERCENTAGE_CHANGE;
         callBack.encodedData = abi.encode(level1PercentageChange, level2PercentageChange);
         bytes memory data = abi.encode(callBack);
         _createNewTransaction(address(this), 0, data, true, 3);
+        return data;
+    }
+
+    /// @notice An authority_modify function
+    /// @notice This function corresponding to MultiSigCallBackType.REMOVE_OWNER
+    /// @dev returns field should use for testing only and can be remove in pratical use
+    function changeTimeLimitForEachTransaction(uint256 limitTime)
+        external
+        onlyOwner
+        returns (bytes memory)
+    {
+        MultiSigCallBack memory callBack;
+        callBack.functionType = MultiSigCallBackType.TIME_LIMIT_EACH_TRANS_CHANGE;
+        callBack.encodedData = abi.encode(limitTime);
+        bytes memory data = abi.encode(callBack);
+        _createNewTransaction(address(this), 0, data, true, 2);
         return data;
     }
 }
